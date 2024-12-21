@@ -33,6 +33,11 @@ func (t *OperationTracker) CreateOperation(ctx context.Context, userID string) (
 		UserID:    userID,
 	}
 
+	t.Logger.Info("Creating operation",
+		zap.String("operation_id", operationID),
+		zap.String("user_id", userID),
+	)
+
 	data, err := json.Marshal(op)
 	if err != nil {
 		t.Logger.Error("Failed to marshal operation", zap.Error(err))
@@ -42,34 +47,46 @@ func (t *OperationTracker) CreateOperation(ctx context.Context, userID string) (
 	key := fmt.Sprintf("operations:%s:%s", userID, operationID)
 	err = t.RedisClient.Set(ctx, key, data, 0).Err()
 	if err != nil {
-		t.Logger.Error("Failed to save operation to Redis", zap.Error(err))
+		t.Logger.Error(
+			"Failed to save operation to Redis",
+			zap.Error(err),
+			zap.String("key", key),
+		)
 		return "", ErrFailedToSaveToRedis
 	}
 
-	// Store in a list for unread notifications
-	listKey := fmt.Sprintf("notifications:%s", userID)
-	err = t.RedisClient.LPush(ctx, listKey, data).Err()
+	// Publish to Redis Stream
+	streamKey := fmt.Sprintf("notifications:%s", userID)
+	err = t.RedisClient.XAdd(ctx, &redis.XAddArgs{
+		Stream: streamKey,
+		Values: map[string]interface{}{"data": data},
+	}).Err()
 	if err != nil {
-		t.Logger.Error("Failed to push operation to notifications list", zap.Error(err))
-		return "", ErrFailedToSaveToRedis
-	}
-
-	// Publish to Pub/Sub channel
-	pubSubChannel := fmt.Sprintf("operation_updates:%s", userID)
-	err = t.RedisClient.Publish(ctx, pubSubChannel, data).Err()
-	if err != nil {
-		t.Logger.Error("Failed to publish to Pub/Sub", zap.Error(err))
+		t.Logger.Error("Failed to publish to Redis Stream", zap.Error(err))
 		return "", ErrFailedToPublishUpdate
 	}
+
+	t.Logger.Info("Operation created",
+		zap.String("operation_id", operationID),
+		zap.String("user_id", userID),
+	)
 
 	return operationID, nil
 }
 
 func (t *OperationTracker) UpdateOperation(ctx context.Context, composedOperationID, status, errorMsg string) error {
+	t.Logger.Info("Updating operation",
+		zap.String("operation_id", composedOperationID),
+	)
+
 	key := fmt.Sprintf("operations:%s", composedOperationID)
 	val, err := t.RedisClient.Get(ctx, key).Result()
 	if err != nil {
-		t.Logger.Error("Operation not found", zap.Error(err))
+		t.Logger.Error(
+			"Operation not found",
+			zap.Error(err),
+			zap.String("operation_id", composedOperationID),
+		)
 		return ErrOperationNotFound
 	}
 
@@ -79,9 +96,14 @@ func (t *OperationTracker) UpdateOperation(ctx context.Context, composedOperatio
 		return ErrFailedToUnmarshal
 	}
 
+	if op.Status != "Completed" && op.Status != "Failed" {
+		return ErrInvalidOperationStatus
+	}
+
 	op.Status = status
 	op.Error = errorMsg
 	op.Timestamp = time.Now().UTC()
+	op.Read = false
 
 	data, err := json.Marshal(op)
 	if err != nil {
@@ -91,25 +113,33 @@ func (t *OperationTracker) UpdateOperation(ctx context.Context, composedOperatio
 
 	err = t.RedisClient.Set(ctx, key, data, 0).Err()
 	if err != nil {
-		t.Logger.Error("Failed to update operation in Redis", zap.Error(err))
+		t.Logger.Error(
+			"Failed to update operation in Redis",
+			zap.Error(err),
+			zap.String("key", key),
+		)
 		return ErrFailedToUpdateRedis
 	}
 
-	// Push to notifications list
-	listKey := fmt.Sprintf("notifications:%s", op.UserID)
-	err = t.RedisClient.LPush(ctx, listKey, data).Err()
+	// Publish to Redis Stream
+	streamKey := fmt.Sprintf("notifications:%s", op.UserID)
+	err = t.RedisClient.XAdd(ctx, &redis.XAddArgs{
+		Stream: streamKey,
+		Values: map[string]interface{}{"data": data},
+	}).Err()
 	if err != nil {
-		t.Logger.Error("Failed to push updated operation to notifications list", zap.Error(err))
-		return ErrFailedToSaveToRedis
-	}
-
-	// Publish the update
-	pubSubChannel := fmt.Sprintf("operation_updates:%s", op.UserID)
-	err = t.RedisClient.Publish(ctx, pubSubChannel, data).Err()
-	if err != nil {
-		t.Logger.Error("Failed to publish operation update", zap.Error(err))
+		t.Logger.Error(
+			"Failed to publish to Redis Stream",
+			zap.Error(err),
+			zap.String("stream_key", streamKey),
+		)
 		return ErrFailedToPublishUpdate
 	}
+
+	t.Logger.Info("Operation updated",
+		zap.String("operation_id", composedOperationID),
+		zap.String("status", status),
+	)
 
 	return nil
 }
@@ -121,6 +151,11 @@ func (t *OperationTracker) GetOperation(ctx context.Context, userID, operationID
 		t.Logger.Error("Operation not found", zap.Error(err))
 		return nil, ErrOperationNotFound
 	}
+
+	t.Logger.Info("Getting operation",
+		zap.String("operation_id", operationID),
+		zap.String("user_id", userID),
+	)
 
 	var op Operation
 	if err := json.Unmarshal([]byte(val), &op); err != nil {
@@ -145,9 +180,13 @@ func (t *OperationTracker) GetOperation(ctx context.Context, userID, operationID
 
 func (t *OperationTracker) ListOperations(ctx context.Context, userID string) ([]Operation, error) {
 	pattern := fmt.Sprintf("operations:%s:*", userID)
+	t.Logger.Info("Listing operations", zap.String("pattern", pattern))
 	keys, err := t.RedisClient.Keys(ctx, pattern).Result()
 	if err != nil {
-		t.Logger.Error("Failed to retrieve keys", zap.Error(err))
+		t.Logger.Error("Failed to retrieve keys",
+			zap.Error(err),
+			zap.String("pattern", pattern),
+		)
 		return nil, ErrFailedToRetrieveKeys
 	}
 
@@ -171,9 +210,17 @@ func (t *OperationTracker) ListOperations(ctx context.Context, userID string) ([
 
 func (t *OperationTracker) MarkOperationAsRead(ctx context.Context, userID, operationID string) error {
 	key := fmt.Sprintf("operations:%s:%s", userID, operationID)
+	t.Logger.Info(
+		"Marking operation as read",
+		zap.String("operation_id", operationID),
+	)
 	val, err := t.RedisClient.Get(ctx, key).Result()
 	if err != nil {
-		t.Logger.Error("Operation not found", zap.Error(err))
+		t.Logger.Error(
+			"Operation not found",
+			zap.Error(err),
+			zap.String("operation_id", operationID),
+		)
 		return ErrOperationNotFound
 	}
 
@@ -197,11 +244,11 @@ func (t *OperationTracker) MarkOperationAsRead(ctx context.Context, userID, oper
 		return ErrFailedToUpdateRedis
 	}
 
-	// Optionally, remove from notifications list
-	listKey := fmt.Sprintf("notifications:%s", userID)
-	err = t.RedisClient.LRem(ctx, listKey, 0, updatedData).Err()
+	// Acknowledge and remove from Redis Stream
+	streamKey := fmt.Sprintf("notifications:%s", userID)
+	err = t.RedisClient.XAck(ctx, streamKey, "consumer-group", operationID).Err()
 	if err != nil {
-		t.Logger.Error("Failed to remove operation from notifications list", zap.Error(err))
+		t.Logger.Error("Failed to acknowledge message in Redis Stream", zap.Error(err))
 		return ErrFailedToRemoveFromList
 	}
 
@@ -209,17 +256,17 @@ func (t *OperationTracker) MarkOperationAsRead(ctx context.Context, userID, oper
 }
 
 func (t *OperationTracker) GetUnreadNotifications(ctx context.Context, userID string) ([]OperationResult, error) {
-	listKey := fmt.Sprintf("notifications:%s", userID)
-	ops, err := t.RedisClient.LRange(ctx, listKey, 0, -1).Result()
+	streamKey := fmt.Sprintf("notifications:%s", userID)
+	entries, err := t.RedisClient.XRange(ctx, streamKey, "-", "+").Result()
 	if err != nil {
-		t.Logger.Error("Failed to retrieve notifications", zap.Error(err))
+		t.Logger.Error("Failed to retrieve notifications from Redis Stream", zap.Error(err))
 		return nil, ErrFailedToRetrieveOps
 	}
 
 	var unreadOps []OperationResult
-	for _, opData := range ops {
+	for _, entry := range entries {
 		var op Operation
-		if err := json.Unmarshal([]byte(opData), &op); err != nil {
+		if err := json.Unmarshal([]byte(entry.Values["data"].(string)), &op); err != nil {
 			continue
 		}
 

@@ -18,4 +18,5 @@ var (
 	ErrWebSocketUpgradeFailed = errors.New("WebSocket upgrade failed")
 	ErrFailedToReceiveMessage = errors.New("failed to receive message")
 	ErrFailedToWriteJSON      = errors.New("failed to write JSON to WebSocket")
+	ErrInvalidOperationStatus = errors.New("invalid operation status, must be one of: Completed, Failed")
 )
